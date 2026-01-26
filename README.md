@@ -18,28 +18,30 @@ Requirements
     Supported Platforms: Linux, Windows, macOS
 
 Components
-1. File Transfer System
+
+### 1. File Transfer System
 
 This system handles chunk-by-chunk file transmission with SHA-256 integrity verification.
-
+```
     server.py: The receiver script. It listens for ICMP packets with the FILEXFER signature, assembles file chunks in order, and verifies the final file hash.
 
     client.py: The sender script. It reads a local file, splits it into chunks, calculates hashes, and transmits them to the target IP.
-
-2. Remote Command Execution System
+```
+### 2. Remote Command Execution System
 
 This system allows for a "ping-based" shell where commands are sent in echo requests and results are returned in echo replies.
-
+```
     executor.py: The listener script (server). It waits for ICMP packets containing a command signature, executes the command on the local system using a shell, and sends the stdout/stderr back in the ICMP reply.
 
     execute.py: The controller script (client). It sends a specific command to a target IP and waits to capture and display the returned output from the ICMP reply.
-
+```
 Usage Instructions
 File Transfer
 
 To receive a file: sudo python3 server.py
-
+```
 To send a file: sudo python3 client.py <target_ip> <path_to_file>
+```
 Remote Command Execution
 
 To start the listener on the target machine: sudo python3 executor.py
